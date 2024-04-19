@@ -78,6 +78,78 @@ def compute_crc32c(path, fast = False):
 
     return hash_alg.hexdigest().decode().upper()
 
+
+def compute_file_crc32c(f, fast=True):
+    
+    hash_alg = google_crc32c.Checksum()
+    buffer_size = 1024 * 1024
+    file_size = int(os.path.getsize(f))
+    file_size_MiB = int(file_size/1024**2)
+    print(f"Hashing file {f} ({file_size_MiB} MiB)", file = sys.stderr, flush = True)
+
+    # if fast mode is enabled, only compute hash at 1024 locations in each
+    # file (equivalent to number of iterations to hash a 1 GiB file)
+    skip_size = 0
+    if file_size_MiB > 1024 and fast:
+        skip_size = int(file_size//(1024**3/buffer_size) - buffer_size)
+        print(f"{f} is >1 GiB; using fast mode", file = sys.stderr, flush = True)
+
+    c = 0
+    ct = 0
+    with open(f, "rb") as fp:
+        while True:
+            # in slow mode: output message every ~100 MB (1 GiB/(10*buffer size))
+            # in fast mode: output message every 100 hash operations
+            if c > 0 and ((not fast and not c % int(1024/10)) or (fast and not c % 100)):
+                print(f"Hashing file {f}; {int(buffer_size*ct/1024**2)}/{file_size_MiB} MiB completed", file = sys.stderr, flush = True)
+
+            data = fp.read(buffer_size)
+            if not data:
+                break
+            hash_alg.update(data)
+            if fast and skip_size > 0:
+                fp.seek(skip_size, 1)
+                ct += (skip_size + buffer_size)//buffer_size
+            else:
+                ct += 1
+            c += 1
+
+    return hash_alg.hexdigest().decode().upper()
+
+
+def flatten_matched_files(matched_files):
+    """
+    Given a list of files, flatten any directories
+    to obtain a "flattened" list of files. 
+    Return (i) the flattened list, and (ii) a list of indices
+    mapping original files to flattened files
+    """
+    flattened_files = []
+    idx = [0]
+    for path in matched_files:
+        increment = 1
+        if os.path.isdir(path):
+            sub_paths = glob.glob(path + "/**", recursive = True)
+            # Remove directories
+            sub_paths = [p for p in sub_paths if not os.path.isdir(p)]
+            flattened_files += sub_paths
+
+            increment = len(sub_paths)
+        idx.append(idx[-1] + increment)
+
+    return flattened_files, idx
+
+
+def merge_hashes(hash_ls):
+    if len(hash_ls) == 1:
+        return hash_ls[0]
+    else:
+        hasher = google_crc32c.Checksum()
+        for hsh in hash_ls:
+            hasher.update(hsh)
+        return hasher.hexdigest().decode().upper()
+
+
 def main(output_dir, jobId, patterns, copy, scratch, finished_scratch):
     jobdir = os.path.join(output_dir, str(jobId))
     if not os.path.isdir(jobdir):
@@ -141,23 +213,54 @@ def main(output_dir, jobId, patterns, copy, scratch, finished_scratch):
     # compute checksums for all files, if job exited successfully
     if os.environ["CANINE_JOB_RC"] == "0":
         print('Computing CRC32C checksums ...', file = sys.stderr, flush = True, end = "")
-        pool = multiprocessing.Pool(8)
-        crc_results = []
-        for dest, f in matched_files:
-            crc_path = os.path.join(os.path.dirname(dest), "." + os.path.basename(dest) + ".crc32c")
-            # if we are delocalizing from a finished scratch disk, do not bother
-            # recomputing checksum for this file if it already exists
-            if scratch and finished_scratch and os.path.exists(crc_path):
-                continue
-            crc_results.append((pool.apply_async(compute_crc32c, (f, scratch)), crc_path))
 
-        for res in crc_results:
-            crc = res[0].get()
-            crc_path = res[1]
+        # PLAN: 
+        # * create a "flattened" list of files. I.e., recurse through directories
+        #   to get all files. (Keep track of which flattened files belong to each 
+        #   matched_file.)
+        # * hash each flattened file (in parallel)
+        # * for each matched file, create a merged hash from its flattened file hashes
+        # Flatten the list of target files
+        
+        # Get the list of crc files
+        matched_dests = [p[0] for p in matched_files]
+        all_crc_paths = [os.path.join(os.path.dirname(dest), "." + os.path.basename(dest) + ".crc32c") for dest in matched_dests]
+        
+        # Determine which files actually need to be hashed
+        to_hash_idx = []
+        if not (scratch and finished_scratch):
+            to_hash_idx = [i for (i,p) in enumerate(all_crc_paths) if not(os.path.exists(p))]
+        crcpaths_to_hash = [all_crc_paths[i] for i in to_hash_idx]
+        targets_to_hash = [matched_files[i][1] for i in to_hash_idx]
+
+        # "Flatten" all directories in the list of target files
+        flattened_targets, m2f_idx = flatten_matched_files(targets_to_hash)
+
+        # Hash the target files in parallel
+        flattened_hashes = []
+        for target in flattened_targets:
+            flattened_hashes.append(pool.apply_async(compute_file_crc32c, (target, scratch)))
+        flattened_hashes = [h.get() for h in flattened_hashes]
+        pool.terminate()
+        
+        #for dest, f in matched_files:
+        #    crc_path = os.path.join(os.path.dirname(dest), "." + os.path.basename(dest) + ".crc32c")
+        #    # if we are delocalizing from a finished scratch disk, do not bother
+        #    # recomputing checksum for this file if it already exists
+        #    if scratch and finished_scratch and os.path.exists(crc_path):
+        #        continue
+        #    crc_results.append((pool.apply_async(compute_crc32c, (f, scratch)), crc_path))
+
+        # Merge hashes for any directories
+        hashes = [merge_hashes(flattened_hashes[m2f_idx[i]:m2f_idx[i+1]]) for i in range(len(m2f_idx)-1)]
+
+        # Write hashes to files
+        crc_results = list(zip(hashes, crcpaths_to_hash))
+        for crc, crc_path in crc_results:
             with open(crc_path, "w") as crc32c_file:
                 crc32c_file.write(crc + "\n")
-        pool.terminate()
         print(' done', file = sys.stderr, flush = True)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('canine-delocalizer')
